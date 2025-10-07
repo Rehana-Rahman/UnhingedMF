@@ -1,124 +1,143 @@
-import argparse, os, sys, re
-from dotenv import load_dotenv
+import sys
+import argparse
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.text import Text
+from rich.markdown import Markdown
+from rich.live import Live
+from rich.spinner import Spinner
+from datetime import datetime
 
-from .storage import load_history, save_history, load_config, save_config
-from .prompts import UNHINGED_SYSTEM_PROMPT
-from .core import start_chat, send
+from storage import HistoryManager, ConfigManager
+from personas import PERSONAS
+from chat import ChatSession
 
 console = Console()
 
-PERSONALITIES = {
-    "unhinged": "Be extra chaotic, witty, and unserious. Roast lightly, never hateful.",
-    "feral": "More energy, more spice, fast one-liners. Keep it playful, not cruel.",
-    "sweet": "Tease gently, chaos with heart. Encouraging, but still funny.",
-    "sassy": "Eye-roll energy, sarcastic quips, confident and breezy."
-}
+def format_timestamp():
+    return datetime.now().strftime("%H:%M")
 
-def build_system_prompt(persona_desc: str) -> str:
-    return UNHINGED_SYSTEM_PROMPT + f"\nActive persona: {persona_desc}\n"
+def show_welcome():
+    welcome = """
+    # 🔥 UnhingedMF
+    
+    Your feral AI companion that talks like a menace.
+    
+    **Commands:**
+    - `/quit` - peace out
+    - `/reset` - wipe memory
+    - `/persona <name>` - change vibe
+    - `/model <name>` - switch model
+    """
+    console.print(Panel(Markdown(welcome), border_style="magenta", title="[bold]Welcome[/bold]"))
+
+def display_message(role, content, style="white"):
+    timestamp = format_timestamp()
+    if role == "user":
+        console.print(f"\n[dim]{timestamp}[/dim] [bold cyan]You[/bold cyan]")
+        console.print(f"  {content}")
+    else:
+        console.print(f"\n[dim]{timestamp}[/dim] [bold magenta]UnhingedMF[/bold magenta]")
+        console.print(Panel(content, border_style="magenta", padding=(0, 2)))
 
 def main():
-    load_dotenv()
-
-    parser = argparse.ArgumentParser(prog="unhingedmf", description="Unhinged, witty terminal chatbot (Gemini)")
-    parser.add_argument("--model", default=None, help="Gemini model name (default from config, e.g., gemini-1.5-flash)")
-    parser.add_argument("--reset", action="store_true", help="Wipe chat memory")
-    parser.add_argument("--personality", choices=list(PERSONALITIES.keys()), help="Choose the vibe")
-    parser.add_argument("--temperature", type=float, help="Creativity (0.0-2.0)")
+    parser = argparse.ArgumentParser(prog="unhingedmf")
+    parser.add_argument("--model", help="Override model name")
+    parser.add_argument("--persona", choices=list(PERSONAS.keys()), help="Set personality")
+    parser.add_argument("--temp", type=float, help="Temperature (0.0-2.0)")
+    parser.add_argument("--reset", action="store_true", help="Clear chat history")
     args = parser.parse_args()
 
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        console.print(Panel.fit(
-            "[bold red]API key missing[/bold red]\n"
-            "Set it via environment variable:\n\n"
-            "[bold]Windows (PowerShell):[/bold]  [green]setx GEMINI_API_KEY \"YOUR_KEY\"[/green]\n"
-            "[bold]macOS/Linux:[/bold]           [green]export GEMINI_API_KEY=\"YOUR_KEY\"[/green]\n",
-            title="Help"
-        ))
-        sys.exit(1)
-
-    cfg = load_config()
-    if args.model: cfg["model"] = args.model
-    if args.personality: cfg["personality"] = args.personality
-    if args.temperature is not None: cfg["temperature"] = args.temperature
-    save_config(cfg)
+    config = ConfigManager()
+    history = HistoryManager()
 
     if args.reset:
-        save_history([])
-        console.print("[yellow]Memory wiped. Fresh start.[/yellow]")
+        history.clear()
+        console.print("[yellow]Memory wiped clean.[/yellow]")
+        return
 
-    history = load_history()
-    persona_desc = PERSONALITIES.get(cfg["personality"], PERSONALITIES["unhinged"])
-    system_prompt = build_system_prompt(persona_desc)
+    if args.model:
+        config.set("model", args.model)
+    if args.persona:
+        config.set("persona", args.persona)
+    if args.temp is not None:
+        config.set("temperature", args.temp)
+
+    show_welcome()
 
     try:
-        chat = start_chat(api_key, cfg["model"], system_prompt, history=history, temperature=cfg["temperature"])
+        session = ChatSession(
+            model=config.get("model"),
+            persona=config.get("persona"),
+            temperature=config.get("temperature"),
+            history=history.load()
+        )
     except Exception as e:
-        console.print(f"[red]Failed to start chat:[/red] {e}")
+        console.print(f"[bold red]Failed to initialize:[/bold red] {e}")
+        console.print("\n[yellow]Make sure your API key is set:[/yellow]")
+        console.print("  export GEMINI_API_KEY='your-key-here'")
         sys.exit(1)
-
-    console.print(Panel("Type your message. Commands: [bold]/reset[/bold], [bold]/persona <name>[/bold], [bold]/quit[/bold].", title="UNHINGEDMF"))
 
     while True:
         try:
-            user = Prompt.ask(Text("You", style="bold cyan")).strip()
-        except (EOFError, KeyboardInterrupt):
-            console.print("\n[dim]bye.[/dim]")
+            user_input = Prompt.ask(f"\n[bold cyan]You[/bold cyan]").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[dim]later ✌️[/dim]")
             break
 
-        if not user:
+        if not user_input:
             continue
 
-        if user.startswith("/"):
-            if user == "/quit":
-                console.print("[dim]bye.[/dim]")
+        if user_input.startswith("/"):
+            cmd_parts = user_input[1:].split(maxsplit=1)
+            cmd = cmd_parts[0].lower()
+            arg = cmd_parts[1] if len(cmd_parts) > 1 else None
+
+            if cmd == "quit":
+                console.print("[dim]peace out ✌️[/dim]")
                 break
-            if user == "/reset":
-                history = []
-                save_history(history)
-                try:
-                    chat = start_chat(api_key, cfg["model"], system_prompt, history=history, temperature=cfg["temperature"])
-                except Exception as e:
-                    console.print(f"[red]Reset error:[/red] {e}")
-                    continue
-                console.print("[yellow]Memory wiped.[/yellow]")
+
+            elif cmd == "reset":
+                history.clear()
+                session.reset()
+                console.print("[yellow]Memory cleared. Fresh start.[/yellow]")
                 continue
-            m = re.match(r"^/persona\s+(\w+)$", user)
-            if m:
-                choice = m.group(1).lower()
-                if choice in PERSONALITIES:
-                    cfg["personality"] = choice
-                    save_config(cfg)
-                    persona_desc = PERSONALITIES[choice]
-                    system_prompt = build_system_prompt(persona_desc)
-                    try:
-                        chat = start_chat(api_key, cfg["model"], system_prompt, history=load_history(), temperature=cfg["temperature"])
-                        console.print(f"[magenta]Persona set to[/magenta] [bold]{choice}[/bold].")
-                    except Exception as e:
-                        console.print(f"[red]Persona change failed:[/red] {e}")
+
+            elif cmd == "persona":
+                if arg and arg in PERSONAS:
+                    config.set("persona", arg)
+                    session.change_persona(arg)
+                    console.print(f"[magenta]Switched to {arg} mode[/magenta]")
                 else:
-                    console.print(f"[red]Unknown persona:[/red] {choice}. Options: {', '.join(PERSONALITIES)}")
+                    options = ", ".join(PERSONAS.keys())
+                    console.print(f"[red]Unknown persona.[/red] Try: {options}")
                 continue
-            console.print("[dim]Unknown command.[/dim]")
-            continue
 
-        console.print(Text("…thinking", style="dim"))
-        try:
-            reply = send(chat, user)
-        except Exception as e:
-            console.print(f"[red]API error:[/red] {e}")
-            continue
+            elif cmd == "model":
+                if arg:
+                    config.set("model", arg)
+                    session.change_model(arg)
+                    console.print(f"[green]Model changed to {arg}[/green]")
+                else:
+                    console.print("[red]Specify a model name[/red]")
+                continue
 
-        history.append({"role": "user", "parts": user})
-        history.append({"role": "model", "parts": reply})
-        save_history(history)
+            else:
+                console.print("[dim]Unknown command[/dim]")
+                continue
 
-        console.print(Panel(Text(reply, style="bold white"), title="bot", border_style="magenta"))
+        with Live(Spinner("dots", text="[dim]thinking...[/dim]"), console=console, transient=True):
+            try:
+                response = session.send(user_input)
+            except Exception as e:
+                console.print(f"[red]Error:[/red] {e}")
+                continue
+
+        history.append("user", user_input)
+        history.append("model", response)
+
+        display_message("bot", response)
 
 if __name__ == "__main__":
     main()
